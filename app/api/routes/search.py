@@ -133,6 +133,7 @@ async def search_face(
     match_results = [
         SearchMatchResult(
             face_id=m.face_id,
+            image_id=m.image_id,
             similarity_score=round(m.score, 4),
             rank=m.rank + 1,
         )

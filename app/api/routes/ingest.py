@@ -49,7 +49,8 @@ def _process_single_image(
         import numpy as np
 
         embeddings = np.stack([f.embedding for f in detected])
-        fm.add_embeddings_batch(park_id, face_ids, embeddings)
+        image_ids = [image_id] * len(detected)
+        fm.add_embeddings_batch(park_id, face_ids, embeddings, image_ids=image_ids)
 
         for face, fid in zip(detected, face_ids):
             face_results.append(

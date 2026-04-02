@@ -59,6 +59,7 @@ class BatchIngestResponse(BaseModel):
 
 class SearchMatchResult(BaseModel):
     face_id: str
+    image_id: str = ""
     similarity_score: float
     rank: int
 

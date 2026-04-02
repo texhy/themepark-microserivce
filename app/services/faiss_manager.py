@@ -27,41 +27,60 @@ EMBEDDING_DIM = 512
 @dataclass
 class SearchMatch:
     face_id: str
+    image_id: str
     score: float
     rank: int
 
 
+def _normalize_id_entry(entry: Any) -> Dict[str, str]:
+    """Handle both old format (plain string) and new format (dict)."""
+    if isinstance(entry, dict):
+        return entry
+    return {"face_id": str(entry), "image_id": ""}
+
+
 @dataclass
 class ParkIndex:
-    """Holds a FAISS index + its face_id mapping for one park."""
+    """Holds a FAISS index + its face_id mapping for one park.
+
+    id_map values are dicts: {"face_id": "uuid", "image_id": "uploads/park/photo.jpg"}
+    Backward-compatible with old format where values were plain face_id strings.
+    """
 
     park_id: str
     index: faiss.Index
-    id_map: Dict[int, str]       # faiss_int_id → face_id (UUID string)
+    id_map: Dict[int, Dict[str, str]]
     _next_id: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
-    def add(self, face_id: str, embedding: np.ndarray) -> int:
+    def add(self, face_id: str, embedding: np.ndarray, image_id: str = "") -> int:
         """Add a single embedding. Returns the assigned FAISS integer id."""
         vec = np.asarray(embedding, dtype=np.float32).reshape(1, EMBEDDING_DIM)
         with self._lock:
             fid = self._next_id
             self.index.add(vec)
-            self.id_map[fid] = face_id
+            self.id_map[fid] = {"face_id": face_id, "image_id": image_id}
             self._next_id += 1
         return fid
 
-    def add_batch(self, face_ids: List[str], embeddings: np.ndarray) -> List[int]:
+    def add_batch(
+        self,
+        face_ids: List[str],
+        embeddings: np.ndarray,
+        image_ids: Optional[List[str]] = None,
+    ) -> List[int]:
         """Add N embeddings at once. Returns list of assigned FAISS int ids."""
         vecs = np.asarray(embeddings, dtype=np.float32).reshape(-1, EMBEDDING_DIM)
         assert vecs.shape[0] == len(face_ids), "face_ids and embeddings count mismatch"
+        if image_ids is None:
+            image_ids = [""] * len(face_ids)
         with self._lock:
             start = self._next_id
             self.index.add(vecs)
             assigned: list[int] = []
             for i, fid_str in enumerate(face_ids):
                 fid = start + i
-                self.id_map[fid] = fid_str
+                self.id_map[fid] = {"face_id": fid_str, "image_id": image_ids[i]}
                 assigned.append(fid)
             self._next_id = start + len(face_ids)
         return assigned
@@ -98,7 +117,7 @@ class FaissManager:
             if idx_path.is_file() and map_path.is_file():
                 index = faiss.read_index(str(idx_path))
                 raw_map = json.loads(map_path.read_text(encoding="utf-8"))
-                id_map = {int(k): v for k, v in raw_map.items()}
+                id_map = {int(k): _normalize_id_entry(v) for k, v in raw_map.items()}
                 next_id = max(id_map.keys()) + 1 if id_map else 0
                 logger.info(
                     "[FAISS] Loaded park=%s from disk — %d vectors, next_id=%d",
@@ -120,16 +139,18 @@ class FaissManager:
             return pi
 
     def add_embedding(
-        self, park_id: str, face_id: str, embedding: np.ndarray
+        self, park_id: str, face_id: str, embedding: np.ndarray,
+        image_id: str = "",
     ) -> int:
         pi = self.get_or_create_index(park_id)
-        return pi.add(face_id, embedding)
+        return pi.add(face_id, embedding, image_id=image_id)
 
     def add_embeddings_batch(
-        self, park_id: str, face_ids: List[str], embeddings: np.ndarray
+        self, park_id: str, face_ids: List[str], embeddings: np.ndarray,
+        image_ids: Optional[List[str]] = None,
     ) -> List[int]:
         pi = self.get_or_create_index(park_id)
-        return pi.add_batch(face_ids, embeddings)
+        return pi.add_batch(face_ids, embeddings, image_ids=image_ids)
 
     # ── Search ───────────────────────────────────────────────────────
 
@@ -155,11 +176,17 @@ class FaissManager:
                 continue
             if float(score) < threshold:
                 continue
-            face_id = pi.id_map.get(int(idx))
-            if face_id is None:
+            entry = pi.id_map.get(int(idx))
+            if entry is None:
                 logger.warning("FAISS returned idx=%d with no id_map entry (park=%s)", idx, park_id)
                 continue
-            matches.append(SearchMatch(face_id=face_id, score=float(score), rank=rank))
+            entry = _normalize_id_entry(entry)
+            matches.append(SearchMatch(
+                face_id=entry["face_id"],
+                image_id=entry.get("image_id", ""),
+                score=float(score),
+                rank=rank,
+            ))
 
         return matches
 
