@@ -1,0 +1,23 @@
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.env
+
+# ML weights (large — downloaded at runtime, root-level only)
+/models/
+/data/faiss_indexes/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
