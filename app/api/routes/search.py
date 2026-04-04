@@ -8,13 +8,14 @@ from __future__ import annotations
 import logging
 import time
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from app.config import get_settings
 from app.models.schemas import SearchMatchResult, SearchResponse
 from app.services.face_detector import ScrfdDetector, YoloFaceDetector
 from app.services.faiss_manager import get_faiss_manager
 from app.services.image_utils import decode_image_bytes, validate_content_type
+from app.utils.malaysia_time import malaysia_today_iso
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/search", tags=["search"])
@@ -30,10 +31,6 @@ async def search_face(
         default="yolo",
         description="Detection backend: 'yolo' (fast, default) or 'scrfd' (same as ingest)",
     ),
-    target_date: str = Form(
-        default=None,
-        description="ISO date (YYYY-MM-DD) — only search faces ingested on this date",
-    ),
 ):
     """Search for matching faces in a park's FAISS index.
 
@@ -44,8 +41,10 @@ async def search_face(
     - **top_k**: Number of top matches to return (default from config)
     - **threshold**: Minimum similarity score (default from config)
     - **detector**: 'yolo' (YOLOv8n-face, faster) or 'scrfd' (InsightFace, same as ingest)
-    - **target_date**: Restrict search to faces ingested on this date (YYYY-MM-DD)
+
+    Search is restricted to **today's** Malaysia calendar date (Asia/Kuala_Lumpur); set on the server only.
     """
+    search_date = malaysia_today_iso()
     settings = get_settings()
     k = top_k if top_k is not None else settings.top_k
     sim_threshold = threshold if threshold is not None else settings.similarity_threshold
@@ -100,6 +99,10 @@ async def search_face(
         fm = get_faiss_manager()
         pi = fm._parks.get(park_id)
         faces_in_index = pi.total_vectors if pi else 0
+        filtered_ff = faces_in_index
+        if pi and search_date in pi.day_ranges:
+            r = pi.day_ranges[search_date]
+            filtered_ff = r["end_id"] - r["start_id"]
         elapsed_ms = (time.perf_counter() - t0) * 1000
         return SearchResponse(
             status="no_face",
@@ -109,7 +112,9 @@ async def search_face(
             query_face_confidence=0.0,
             search_time_ms=round(elapsed_ms, 2),
             faces_in_index=faces_in_index,
+            filtered_faces=filtered_ff,
             detector_used=detector_used,
+            target_date=search_date,
         )
 
     # ── Search FAISS ─────────────────────────────────────────────
@@ -125,7 +130,9 @@ async def search_face(
             query_face_confidence=round(face.confidence, 4),
             search_time_ms=round(elapsed_ms, 2),
             faces_in_index=0,
+            filtered_faces=0,
             detector_used=detector_used,
+            target_date=search_date,
         )
 
     matches = fm.search(
@@ -133,7 +140,7 @@ async def search_face(
         query_embedding=face.embedding,
         top_k=k,
         threshold=sim_threshold,
-        target_date=target_date,
+        target_date=search_date,
     )
 
     match_results = [
@@ -149,8 +156,8 @@ async def search_face(
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
     filtered_count = pi.total_vectors
-    if target_date and target_date in pi.day_ranges:
-        r = pi.day_ranges[target_date]
+    if search_date in pi.day_ranges:
+        r = pi.day_ranges[search_date]
         filtered_count = r["end_id"] - r["start_id"]
 
     logger.info(
@@ -161,7 +168,7 @@ async def search_face(
         pi.total_vectors,
         filtered_count,
         sim_threshold,
-        target_date or "all",
+        search_date,
         elapsed_ms,
     )
 
@@ -175,5 +182,5 @@ async def search_face(
         faces_in_index=pi.total_vectors,
         filtered_faces=filtered_count,
         detector_used=detector_used,
-        target_date=target_date,
+        target_date=search_date,
     )

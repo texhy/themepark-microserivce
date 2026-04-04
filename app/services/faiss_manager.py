@@ -11,26 +11,17 @@ import json
 import logging
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from zoneinfo import ZoneInfo
-
 import faiss
 import numpy as np
 
 from app.config import get_settings
+from app.utils.malaysia_time import malaysia_cutoff_date_iso, malaysia_today_iso
 
 logger = logging.getLogger(__name__)
 
 EMBEDDING_DIM = 512
-
-# Malaysia local calendar date — must match Node ingest_date / target_date (Asia/Kuala_Lumpur).
-_MALAYSIA_TZ = ZoneInfo("Asia/Kuala_Lumpur")
-
-
-def _malaysia_today_iso() -> str:
-    return datetime.now(_MALAYSIA_TZ).date().isoformat()
 
 
 @dataclass
@@ -79,7 +70,7 @@ class ParkIndex:
     ) -> int:
         """Add a single embedding. Returns the assigned FAISS integer id."""
         vec = np.asarray(embedding, dtype=np.float32).reshape(1, EMBEDDING_DIM)
-        today = ingest_date or _malaysia_today_iso()
+        today = ingest_date or malaysia_today_iso()
         with self._lock:
             fid = self._next_id
             self.index.add(vec)
@@ -102,7 +93,7 @@ class ParkIndex:
         assert vecs.shape[0] == len(face_ids), "face_ids and embeddings count mismatch"
         if image_ids is None:
             image_ids = [""] * len(face_ids)
-        today = ingest_date or _malaysia_today_iso()
+        today = ingest_date or malaysia_today_iso()
         with self._lock:
             start = self._next_id
             self.index.add(vecs)
@@ -273,10 +264,7 @@ class FaissManager:
         if not pi:
             return 0
 
-        cutoff = (
-            datetime.now(_MALAYSIA_TZ).date()
-            - timedelta(days=max(keep_days - 1, 0))
-        ).isoformat()
+        cutoff = malaysia_cutoff_date_iso(keep_days)
 
         ids_to_keep: dict[int, dict] = {}
         removed = 0

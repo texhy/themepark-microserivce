@@ -22,6 +22,7 @@ from app.models.schemas import (
 from app.services.face_detector import ScrfdDetector
 from app.services.faiss_manager import get_faiss_manager
 from app.services.image_utils import decode_image_bytes, validate_content_type
+from app.utils.malaysia_time import malaysia_today_iso
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/ingest", tags=["ingest"])
@@ -76,7 +77,6 @@ async def ingest_image(
     file: UploadFile = File(...),
     park_id: str = Form(...),
     image_id: str = Form(...),
-    ingest_date: str = Form(default=None, description="ISO date (YYYY-MM-DD); defaults to today"),
 ):
     """Ingest a single photographer image: detect → embed → store in FAISS."""
     err = validate_content_type(file.content_type)
@@ -91,7 +91,7 @@ async def ingest_image(
 
     try:
         faces_detected, face_results = _process_single_image(
-            raw, park_id, image_id, ingest_date=ingest_date or "",
+            raw, park_id, image_id, ingest_date=malaysia_today_iso(),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -125,7 +125,6 @@ async def ingest_batch(
     files: List[UploadFile] = File(...),
     park_id: str = Form(...),
     image_ids: str = Form(..., description="Comma-separated image IDs, one per file"),
-    ingest_date: str = Form(default=None, description="ISO date (YYYY-MM-DD); defaults to today"),
 ):
     """Ingest multiple images in one request.
 
@@ -142,6 +141,7 @@ async def ingest_batch(
     t0 = time.perf_counter()
     results: list[BatchIngestImageResult] = []
     total_faces = 0
+    today = malaysia_today_iso()
 
     for upload, img_id in zip(files, id_list):
         err = validate_content_type(upload.content_type)
@@ -162,7 +162,7 @@ async def ingest_batch(
 
         try:
             n, faces = _process_single_image(
-                raw, park_id, img_id, ingest_date=ingest_date or "",
+                raw, park_id, img_id, ingest_date=today,
             )
             total_faces += n
             results.append(
