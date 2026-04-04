@@ -33,6 +33,7 @@ def _process_single_image(
     raw_bytes: bytes,
     park_id: str,
     image_id: str,
+    ingest_date: str = "",
 ) -> tuple[int, List[IngestFaceResult]]:
     """Detect faces, generate embeddings, store in FAISS.
 
@@ -50,7 +51,10 @@ def _process_single_image(
 
         embeddings = np.stack([f.embedding for f in detected])
         image_ids = [image_id] * len(detected)
-        fm.add_embeddings_batch(park_id, face_ids, embeddings, image_ids=image_ids)
+        fm.add_embeddings_batch(
+            park_id, face_ids, embeddings,
+            image_ids=image_ids, ingest_date=ingest_date,
+        )
 
         for face, fid in zip(detected, face_ids):
             face_results.append(
@@ -72,6 +76,7 @@ async def ingest_image(
     file: UploadFile = File(...),
     park_id: str = Form(...),
     image_id: str = Form(...),
+    ingest_date: str = Form(default=None, description="ISO date (YYYY-MM-DD); defaults to today"),
 ):
     """Ingest a single photographer image: detect → embed → store in FAISS."""
     err = validate_content_type(file.content_type)
@@ -85,7 +90,9 @@ async def ingest_image(
     t0 = time.perf_counter()
 
     try:
-        faces_detected, face_results = _process_single_image(raw, park_id, image_id)
+        faces_detected, face_results = _process_single_image(
+            raw, park_id, image_id, ingest_date=ingest_date or "",
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception:
@@ -118,6 +125,7 @@ async def ingest_batch(
     files: List[UploadFile] = File(...),
     park_id: str = Form(...),
     image_ids: str = Form(..., description="Comma-separated image IDs, one per file"),
+    ingest_date: str = Form(default=None, description="ISO date (YYYY-MM-DD); defaults to today"),
 ):
     """Ingest multiple images in one request.
 
@@ -153,7 +161,9 @@ async def ingest_batch(
             continue
 
         try:
-            n, faces = _process_single_image(raw, park_id, img_id)
+            n, faces = _process_single_image(
+                raw, park_id, img_id, ingest_date=ingest_date or "",
+            )
             total_faces += n
             results.append(
                 BatchIngestImageResult(image_id=img_id, faces_detected=n, faces=faces)

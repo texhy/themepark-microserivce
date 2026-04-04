@@ -21,3 +21,8 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# Local GPU / CUDA helpers — never commit (use requirements-gpu.example.txt as template)
+requirements-gpu.txt
+app/core/_nvidia_preload.py
+.venv-msp-test/

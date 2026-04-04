@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     )
 
     similarity_threshold: float = Field(default=0.45, validation_alias="SIMILARITY_THRESHOLD")
-    top_k: int = Field(default=20, validation_alias="TOP_K")
+    top_k: int = Field(default=100, validation_alias="TOP_K")
 
     cors_origins: str = Field(default="*", validation_alias="CORS_ORIGINS")
 

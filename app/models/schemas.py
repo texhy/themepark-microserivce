@@ -72,4 +72,6 @@ class SearchResponse(BaseModel):
     query_face_confidence: float
     search_time_ms: float
     faces_in_index: int
+    filtered_faces: int = 0
     detector_used: str
+    target_date: Optional[str] = None

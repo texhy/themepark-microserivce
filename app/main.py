@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app import __version__
-from app.api.routes import health, ingest, search
+from app.api.routes import health, ingest, manage, search
 from app.config import get_settings
 from app.core.model_loader import load_models, unload_models
 from app.services.faiss_manager import get_faiss_manager
@@ -84,6 +84,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(ingest.router)
     app.include_router(search.router)
+    app.include_router(manage.router)
 
     @app.get("/")
     def root() -> dict[str, str]:

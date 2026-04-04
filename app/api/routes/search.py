@@ -30,16 +30,21 @@ async def search_face(
         default="yolo",
         description="Detection backend: 'yolo' (fast, default) or 'scrfd' (same as ingest)",
     ),
+    target_date: str = Form(
+        default=None,
+        description="ISO date (YYYY-MM-DD) — only search faces ingested on this date",
+    ),
 ):
     """Search for matching faces in a park's FAISS index.
 
     Accepts a selfie image, detects the single best face, generates an
     ArcFace embedding, and searches the park's FAISS index for matches.
 
-    Query parameters:
+    Form fields:
     - **top_k**: Number of top matches to return (default from config)
     - **threshold**: Minimum similarity score (default from config)
     - **detector**: 'yolo' (YOLOv8n-face, faster) or 'scrfd' (InsightFace, same as ingest)
+    - **target_date**: Restrict search to faces ingested on this date (YYYY-MM-DD)
     """
     settings = get_settings()
     k = top_k if top_k is not None else settings.top_k
@@ -128,6 +133,7 @@ async def search_face(
         query_embedding=face.embedding,
         top_k=k,
         threshold=sim_threshold,
+        target_date=target_date,
     )
 
     match_results = [
@@ -142,13 +148,20 @@ async def search_face(
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
+    filtered_count = pi.total_vectors
+    if target_date and target_date in pi.day_ranges:
+        r = pi.day_ranges[target_date]
+        filtered_count = r["end_id"] - r["start_id"]
+
     logger.info(
-        "[Search] park=%s detector=%s matches=%d/%d threshold=%.2f time=%.1fms",
+        "[Search] park=%s detector=%s matches=%d/%d (filtered=%d) threshold=%.2f date=%s time=%.1fms",
         park_id,
         detector_used,
         len(match_results),
         pi.total_vectors,
+        filtered_count,
         sim_threshold,
+        target_date or "all",
         elapsed_ms,
     )
 
@@ -160,5 +173,7 @@ async def search_face(
         query_face_confidence=round(face.confidence, 4),
         search_time_ms=round(elapsed_ms, 2),
         faces_in_index=pi.total_vectors,
+        filtered_faces=filtered_count,
         detector_used=detector_used,
+        target_date=target_date,
     )

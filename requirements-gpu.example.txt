@@ -1,4 +1,5 @@
 # GPU deps for RunPod / any CUDA machine.
+# Copy to requirements-gpu.txt locally (gitignored) and: pip install -r requirements-gpu.txt
 # Installs onnxruntime-gpu INSTEAD of onnxruntime.
 fastapi==0.115.6
 uvicorn[standard]==0.32.1
