@@ -10,18 +10,27 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
+
 import faiss
 import numpy as np
 
 from app.config import get_settings
-from app.utils.malaysia_time import malaysia_cutoff_date_iso, malaysia_today_iso
 
 logger = logging.getLogger(__name__)
 
 EMBEDDING_DIM = 512
+
+_MALAYSIA_TZ = ZoneInfo("Asia/Kuala_Lumpur")
+
+
+def _malaysia_today_iso() -> str:
+    return datetime.now(_MALAYSIA_TZ).date().isoformat()
 
 
 @dataclass
@@ -59,10 +68,22 @@ class ParkIndex:
         """Expand the day_ranges entry for *date_str* to cover [min_id, max_id+1)."""
         if date_str in self.day_ranges:
             r = self.day_ranges[date_str]
+            old_start, old_end = r["start_id"], r["end_id"]
             r["start_id"] = min(r["start_id"], min_id)
             r["end_id"] = max(r["end_id"], max_id + 1)
+            if r["start_id"] != old_start or r["end_id"] != old_end:
+                logger.info(
+                    "  ├─ day_range[%s] expanded: [%d, %d) → [%d, %d)  (+%d vectors)",
+                    date_str, old_start, old_end,
+                    r["start_id"], r["end_id"],
+                    r["end_id"] - r["start_id"] - (old_end - old_start),
+                )
         else:
             self.day_ranges[date_str] = {"start_id": min_id, "end_id": max_id + 1}
+            logger.info(
+                "  ├─ day_range[%s] CREATED: [%d, %d)  (%d vectors)",
+                date_str, min_id, max_id + 1, max_id + 1 - min_id,
+            )
 
     def add(
         self, face_id: str, embedding: np.ndarray,
@@ -70,7 +91,7 @@ class ParkIndex:
     ) -> int:
         """Add a single embedding. Returns the assigned FAISS integer id."""
         vec = np.asarray(embedding, dtype=np.float32).reshape(1, EMBEDDING_DIM)
-        today = ingest_date or malaysia_today_iso()
+        today = ingest_date or _malaysia_today_iso()
         with self._lock:
             fid = self._next_id
             self.index.add(vec)
@@ -93,7 +114,7 @@ class ParkIndex:
         assert vecs.shape[0] == len(face_ids), "face_ids and embeddings count mismatch"
         if image_ids is None:
             image_ids = [""] * len(face_ids)
-        today = ingest_date or malaysia_today_iso()
+        today = ingest_date or _malaysia_today_iso()
         with self._lock:
             start = self._next_id
             self.index.add(vecs)
@@ -106,6 +127,14 @@ class ParkIndex:
                 assigned.append(fid)
             self._next_id = start + len(face_ids)
             self._update_day_range(today, start, start + len(face_ids) - 1)
+
+            logger.info(
+                "  ├─ add_batch: %d faces → FAISS IDs [%d, %d)  date=%s  "
+                "index_total=%d  next_id=%d",
+                len(face_ids), start, self._next_id, today,
+                self.index.ntotal, self._next_id,
+            )
+
         return assigned
 
     @property
@@ -144,7 +173,6 @@ class FaissManager:
                 id_map = {int(k): _normalize_id_entry(v) for k, v in raw_map.items()}
                 next_id = max(id_map.keys()) + 1 if id_map else 0
 
-                # Load day_ranges from sidecar, or rebuild from id_map
                 if ranges_path.is_file():
                     day_ranges = json.loads(ranges_path.read_text(encoding="utf-8"))
                 else:
@@ -160,9 +188,15 @@ class FaissManager:
                         else:
                             day_ranges[d] = {"start_id": int_id, "end_id": int_id + 1}
 
+                day_summary = ", ".join(
+                    f"{d}: [{r['start_id']}, {r['end_id']}) = {r['end_id'] - r['start_id']}v"
+                    for d, r in sorted(day_ranges.items())
+                )
                 logger.info(
-                    "[FAISS] Loaded park=%s from disk — %d vectors, %d day(s), next_id=%d",
+                    "[FAISS] Loaded park=%s — %d vectors, %d day(s), next_id=%d\n"
+                    "  └─ days: {%s}",
                     park_id, index.ntotal, len(day_ranges), next_id,
+                    day_summary or "none",
                 )
             else:
                 index = faiss.IndexFlatIP(EMBEDDING_DIM)
@@ -209,28 +243,62 @@ class FaissManager:
 
         When *target_date* is provided (ISO ``YYYY-MM-DD``), only vectors
         ingested on that date are considered via ``faiss.IDSelectorRange``.
+        If target_date is specified but has no vectors, returns empty (no silent fallback).
         """
         pi = self._parks.get(park_id)
-        if pi is None or pi.total_vectors == 0:
+        if pi is None:
+            logger.warning("[FAISS Search] park=%s NOT LOADED — returning empty", park_id)
+            return []
+        if pi.total_vectors == 0:
+            logger.warning("[FAISS Search] park=%s index is EMPTY — returning empty", park_id)
             return []
 
         vec = np.asarray(query_embedding, dtype=np.float32).reshape(1, EMBEDDING_DIM)
 
-        search_params = None
-        effective_total = pi.total_vectors
+        t0 = time.perf_counter()
 
-        if target_date and target_date in pi.day_ranges:
-            r = pi.day_ranges[target_date]
-            sel = faiss.IDSelectorRange(r["start_id"], r["end_id"])
-            search_params = faiss.SearchParameters(sel=sel)
-            effective_total = r["end_id"] - r["start_id"]
+        with pi._lock:
+            search_params = None
+            effective_total = pi.total_vectors
 
-        k = min(top_k, max(effective_total, 1))
+            if target_date:
+                if target_date in pi.day_ranges:
+                    r = pi.day_ranges[target_date]
+                    sel = faiss.IDSelectorRange(r["start_id"], r["end_id"])
+                    search_params = faiss.SearchParameters(sel=sel)
+                    effective_total = r["end_id"] - r["start_id"]
+                    logger.info(
+                        "[FAISS Search] park=%s date=%s → filtering IDs [%d, %d) = %d vectors "
+                        "(total in index: %d)",
+                        park_id, target_date,
+                        r["start_id"], r["end_id"], effective_total,
+                        pi.total_vectors,
+                    )
+                else:
+                    available_dates = sorted(pi.day_ranges.keys())
+                    logger.warning(
+                        "[FAISS Search] park=%s date=%s NOT FOUND in day_ranges! "
+                        "No vectors for this date — returning empty. "
+                        "Available dates: %s",
+                        park_id, target_date, available_dates,
+                    )
+                    return []
+            else:
+                logger.info(
+                    "[FAISS Search] park=%s date=ALL (no filter) — searching all %d vectors",
+                    park_id, pi.total_vectors,
+                )
 
-        if search_params:
-            scores, indices = pi.index.search(vec, k, params=search_params)
-        else:
-            scores, indices = pi.index.search(vec, k)
+            k = min(top_k, max(effective_total, 1))
+
+            if search_params:
+                scores, indices = pi.index.search(vec, k, params=search_params)
+            else:
+                scores, indices = pi.index.search(vec, k)
+
+            id_map_copy = dict(pi.id_map)
+
+        t_search = time.perf_counter()
 
         matches: list[SearchMatch] = []
         for rank, (score, idx) in enumerate(zip(scores[0], indices[0])):
@@ -238,9 +306,12 @@ class FaissManager:
                 continue
             if float(score) < threshold:
                 continue
-            entry = pi.id_map.get(int(idx))
+            entry = id_map_copy.get(int(idx))
             if entry is None:
-                logger.warning("FAISS returned idx=%d with no id_map entry (park=%s)", idx, park_id)
+                logger.warning(
+                    "  └─ FAISS returned idx=%d with no id_map entry (park=%s) — orphan vector!",
+                    idx, park_id,
+                )
                 continue
             entry = _normalize_id_entry(entry)
             matches.append(SearchMatch(
@@ -250,21 +321,49 @@ class FaissManager:
                 rank=rank,
             ))
 
+        valid_mask = indices[0] >= 0
+        raw_hit_count = int(valid_mask.sum())
+        top_scores = sorted(
+            [float(s) for s, i in zip(scores[0], indices[0]) if i >= 0],
+            reverse=True,
+        )
+
+        logger.info(
+            "[FAISS Search] park=%s completed in %.2fms — "
+            "k=%d, raw_hits=%d, above_threshold=%d (threshold=%.3f)\n"
+            "  ├─ ALL scores from FAISS (sorted): %s",
+            park_id, (t_search - t0) * 1000,
+            k, raw_hit_count, len(matches), threshold,
+            [round(s, 4) for s in top_scores[:10]],
+        )
+
+        if matches:
+            top = matches[0]
+            logger.info(
+                "  └─ best match: score=%.4f face_id=%s image=%s",
+                top.score, top.face_id, top.image_id,
+            )
+        elif top_scores:
+            logger.warning(
+                "  └─ NO matches above threshold=%.3f — closest score was %.4f "
+                "(missed by %.4f)",
+                threshold, top_scores[0], threshold - top_scores[0],
+            )
+
         return matches
 
     # ── Cleanup ────────────────────────────────────────────────────────
 
     def cleanup_old_faces(self, park_id: str, keep_days: int = 1) -> int:
-        """Remove faces older than *keep_days* and rebuild the index.
-
-        Returns the number of vectors removed.  At ~3 000 vectors the full
-        rebuild takes < 50 ms — negligible for a maintenance operation.
-        """
+        """Remove faces older than *keep_days* and rebuild the index."""
         pi = self._parks.get(park_id)
         if not pi:
             return 0
 
-        cutoff = malaysia_cutoff_date_iso(keep_days)
+        cutoff = (
+            datetime.now(_MALAYSIA_TZ).date()
+            - timedelta(days=max(keep_days - 1, 0))
+        ).isoformat()
 
         ids_to_keep: dict[int, dict] = {}
         removed = 0
@@ -309,8 +408,8 @@ class FaissManager:
             pi._next_id = new_id
 
         logger.info(
-            "[FAISS] Cleanup park=%s removed=%d remaining=%d",
-            park_id, removed, new_id,
+            "[FAISS] Cleanup park=%s removed=%d remaining=%d cutoff=%s",
+            park_id, removed, new_id, cutoff,
         )
         return removed
 
@@ -328,6 +427,8 @@ class FaissManager:
         map_path = park_dir / "id_map.json"
         ranges_path = park_dir / "day_ranges.json"
 
+        t0 = time.perf_counter()
+
         with pi._lock:
             faiss.write_index(pi.index, str(idx_path))
             map_path.write_text(
@@ -339,9 +440,17 @@ class FaissManager:
                 encoding="utf-8",
             )
 
+        save_ms = (time.perf_counter() - t0) * 1000
+
+        day_summary = ", ".join(
+            f"{d}: {r['end_id'] - r['start_id']}v"
+            for d, r in sorted(pi.day_ranges.items())
+        )
         logger.info(
-            "[FAISS] Saved park=%s — %d vectors, %d day(s) → %s",
-            park_id, pi.total_vectors, len(pi.day_ranges), park_dir,
+            "[FAISS] Saved park=%s — %d vectors, %d day(s) in %.1fms → %s\n"
+            "  └─ days: {%s}",
+            park_id, pi.total_vectors, len(pi.day_ranges), save_ms, park_dir,
+            day_summary or "none",
         )
 
     def save_all(self) -> None:

@@ -7,9 +7,10 @@ POST /ingest/batch     Multi-image batch ingestion
 from __future__ import annotations
 
 import logging
+import re
 import time
 import uuid
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
@@ -22,12 +23,26 @@ from app.models.schemas import (
 from app.services.face_detector import ScrfdDetector
 from app.services.faiss_manager import get_faiss_manager
 from app.services.image_utils import decode_image_bytes, validate_content_type
-from app.utils.malaysia_time import malaysia_today_iso
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/ingest", tags=["ingest"])
 
 _detector = ScrfdDetector()
+
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _validate_ingest_date(raw: Optional[str]) -> str:
+    """Return a validated YYYY-MM-DD string, or empty string to use today's date."""
+    if not raw or not raw.strip():
+        return ""
+    cleaned = raw.strip()
+    if not _ISO_DATE_RE.match(cleaned):
+        raise HTTPException(
+            status_code=400,
+            detail=f"ingest_date must be YYYY-MM-DD format, got: '{cleaned}'",
+        )
+    return cleaned
 
 
 def _process_single_image(
@@ -40,8 +55,13 @@ def _process_single_image(
 
     Returns (faces_detected, list_of_face_results).
     """
+    t0 = time.perf_counter()
+
     image = decode_image_bytes(raw_bytes)
+    t_decode = time.perf_counter()
+
     detected = _detector.detect(image)
+    t_detect = time.perf_counter()
 
     fm = get_faiss_manager()
     face_results: list[IngestFaceResult] = []
@@ -67,6 +87,17 @@ def _process_single_image(
                 )
             )
 
+    t_store = time.perf_counter()
+
+    logger.info(
+        "  ├─ image=%s faces=%d  [decode=%.0fms detect=%.0fms store=%.0fms]",
+        image_id.split("/")[-1] if "/" in image_id else image_id,
+        len(detected),
+        (t_decode - t0) * 1000,
+        (t_detect - t_decode) * 1000,
+        (t_store - t_detect) * 1000,
+    )
+
     return len(detected), face_results
 
 
@@ -77,8 +108,11 @@ async def ingest_image(
     file: UploadFile = File(...),
     park_id: str = Form(...),
     image_id: str = Form(...),
+    ingest_date: Optional[str] = Form(default=None, description="ISO date (YYYY-MM-DD); defaults to today"),
 ):
     """Ingest a single photographer image: detect → embed → store in FAISS."""
+    date_str = _validate_ingest_date(ingest_date)
+
     err = validate_content_type(file.content_type)
     if err:
         raise HTTPException(status_code=400, detail=err)
@@ -89,9 +123,14 @@ async def ingest_image(
 
     t0 = time.perf_counter()
 
+    logger.info(
+        "[Ingest] START park=%s image=%s date=%s size=%dKB",
+        park_id, image_id, date_str or "(auto→today)", len(raw) // 1024,
+    )
+
     try:
         faces_detected, face_results = _process_single_image(
-            raw, park_id, image_id, ingest_date=malaysia_today_iso(),
+            raw, park_id, image_id, ingest_date=date_str,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -104,9 +143,13 @@ async def ingest_image(
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
+    pi = fm._parks.get(park_id)
     logger.info(
-        "[Ingest] image_id=%s park_id=%s faces=%d time=%.1fms",
-        image_id, park_id, faces_detected, elapsed_ms,
+        "[Ingest] DONE park=%s image=%s faces=%d time=%.1fms  "
+        "index_total=%d next_id=%d",
+        park_id, image_id, faces_detected, elapsed_ms,
+        pi.total_vectors if pi else 0,
+        pi._next_id if pi else 0,
     )
 
     return IngestResponse(
@@ -125,12 +168,15 @@ async def ingest_batch(
     files: List[UploadFile] = File(...),
     park_id: str = Form(...),
     image_ids: str = Form(..., description="Comma-separated image IDs, one per file"),
+    ingest_date: Optional[str] = Form(default=None, description="ISO date (YYYY-MM-DD); defaults to today"),
 ):
     """Ingest multiple images in one request.
 
     The FAISS index is saved once at the end (not per-image) for efficiency.
     `image_ids` should be a comma-separated string with one ID per uploaded file.
     """
+    date_str = _validate_ingest_date(ingest_date)
+
     id_list = [s.strip() for s in image_ids.split(",") if s.strip()]
     if len(id_list) != len(files):
         raise HTTPException(
@@ -138,17 +184,33 @@ async def ingest_batch(
             detail=f"Got {len(files)} files but {len(id_list)} image_ids",
         )
 
+    fm = get_faiss_manager()
+    pi_before = fm._parks.get(park_id)
+    vectors_before = pi_before.total_vectors if pi_before else 0
+    next_id_before = pi_before._next_id if pi_before else 0
+
+    logger.info(
+        "═══════════════════════════════════════════════════════════════\n"
+        "[Batch Ingest] START  park=%s  images=%d  date=%s\n"
+        "  ├─ index BEFORE: %d vectors, next_id=%d\n"
+        "  ├─ day_ranges BEFORE: %s",
+        park_id, len(files), date_str or "(auto→today)",
+        vectors_before, next_id_before,
+        sorted(pi_before.day_ranges.keys()) if pi_before else "[]",
+    )
+
     t0 = time.perf_counter()
     results: list[BatchIngestImageResult] = []
     total_faces = 0
-    today = malaysia_today_iso()
+    errors = 0
 
-    for upload, img_id in zip(files, id_list):
+    for i, (upload, img_id) in enumerate(zip(files, id_list)):
         err = validate_content_type(upload.content_type)
         if err:
             results.append(
                 BatchIngestImageResult(image_id=img_id, faces_detected=0, faces=[], error=err)
             )
+            errors += 1
             continue
 
         raw = await upload.read()
@@ -158,11 +220,12 @@ async def ingest_batch(
                     image_id=img_id, faces_detected=0, faces=[], error="Empty file"
                 )
             )
+            errors += 1
             continue
 
         try:
             n, faces = _process_single_image(
-                raw, park_id, img_id, ingest_date=today,
+                raw, park_id, img_id, ingest_date=date_str,
             )
             total_faces += n
             results.append(
@@ -175,15 +238,30 @@ async def ingest_batch(
                     image_id=img_id, faces_detected=0, faces=[], error=str(exc)
                 )
             )
+            errors += 1
 
-    fm = get_faiss_manager()
+    t_process = time.perf_counter()
+
     fm.save_index(park_id)
 
-    elapsed_ms = (time.perf_counter() - t0) * 1000
+    t_save = time.perf_counter()
+    elapsed_ms = (t_save - t0) * 1000
+
+    pi_after = fm._parks.get(park_id)
+    vectors_after = pi_after.total_vectors if pi_after else 0
+    next_id_after = pi_after._next_id if pi_after else 0
 
     logger.info(
-        "[Batch Ingest] park_id=%s images=%d total_faces=%d time=%.1fms",
-        park_id, len(files), total_faces, elapsed_ms,
+        "[Batch Ingest] DONE  park=%s  images=%d  faces=%d  errors=%d  time=%.1fms\n"
+        "  ├─ processing: %.1fms  saving: %.1fms\n"
+        "  ├─ index AFTER: %d vectors (+%d), next_id=%d\n"
+        "  ├─ day_ranges AFTER: %s\n"
+        "═══════════════════════════════════════════════════════════════",
+        park_id, len(files), total_faces, errors, elapsed_ms,
+        (t_process - t0) * 1000, (t_save - t_process) * 1000,
+        vectors_after, vectors_after - vectors_before, next_id_after,
+        {d: f"[{r['start_id']},{r['end_id']})={r['end_id']-r['start_id']}v"
+         for d, r in sorted((pi_after.day_ranges if pi_after else {}).items())},
     )
 
     return BatchIngestResponse(

@@ -138,6 +138,8 @@ class YoloFaceDetector:
 
         Returns None if no face is found above the confidence threshold.
         """
+        import time
+
         from app.services.face_aligner import align_face
         from app.services.face_embedder import ArcFaceEmbedder
 
@@ -151,11 +153,20 @@ class YoloFaceDetector:
                 return None
             return max(faces, key=lambda f: _bbox_area(f.bbox) * f.confidence)
 
+        _t0 = time.perf_counter()
+
         letterboxed, scale, (dw, dh) = self._letterbox(image)
         input_tensor = self._preprocess(letterboxed)
+
+        _t_pre = time.perf_counter()
+
         outputs = session.run(None, {session.get_inputs()[0].name: input_tensor})
 
+        _t_yolo = time.perf_counter()
+
         boxes, scores, landmarks = self._postprocess(outputs)
+
+        _t_post = time.perf_counter()
 
         if len(boxes) == 0:
             return None
@@ -171,8 +182,25 @@ class YoloFaceDetector:
         lm5 = landmarks[best_idx].reshape(5, 2)
 
         aligned = align_face(image, lm5)
+
+        _t_align = time.perf_counter()
+
         embedder = ArcFaceEmbedder()
         embedding = embedder.embed(aligned)
+
+        _t_embed = time.perf_counter()
+
+        logger.info(
+            "[YOLO Timing] image=%dx%d preprocess=%.1fms yolo_infer=%.1fms "
+            "postprocess=%.1fms align=%.1fms arcface=%.1fms total=%.1fms",
+            image.shape[1], image.shape[0],
+            (_t_pre - _t0) * 1000,
+            (_t_yolo - _t_pre) * 1000,
+            (_t_post - _t_yolo) * 1000,
+            (_t_align - _t_post) * 1000,
+            (_t_embed - _t_align) * 1000,
+            (_t_embed - _t0) * 1000,
+        )
 
         return DetectedFace(
             bbox=bbox,

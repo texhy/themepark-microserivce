@@ -6,19 +6,22 @@ POST /search/   Upload selfie → detect face → embed → search FAISS → ret
 from __future__ import annotations
 
 import logging
+import re
 import time
+from typing import Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 
 from app.config import get_settings
 from app.models.schemas import SearchMatchResult, SearchResponse
 from app.services.face_detector import ScrfdDetector, YoloFaceDetector
 from app.services.faiss_manager import get_faiss_manager
 from app.services.image_utils import decode_image_bytes, validate_content_type
-from app.utils.malaysia_time import malaysia_today_iso
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/search", tags=["search"])
+
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 @router.post("/", response_model=SearchResponse)
@@ -31,23 +34,23 @@ async def search_face(
         default="yolo",
         description="Detection backend: 'yolo' (fast, default) or 'scrfd' (same as ingest)",
     ),
+    target_date: Optional[str] = Form(
+        default=None,
+        description="ISO date (YYYY-MM-DD) — only search faces ingested on this date",
+    ),
 ):
-    """Search for matching faces in a park's FAISS index.
-
-    Accepts a selfie image, detects the single best face, generates an
-    ArcFace embedding, and searches the park's FAISS index for matches.
-
-    Form fields:
-    - **top_k**: Number of top matches to return (default from config)
-    - **threshold**: Minimum similarity score (default from config)
-    - **detector**: 'yolo' (YOLOv8n-face, faster) or 'scrfd' (InsightFace, same as ingest)
-
-    Search is restricted to **today's** Malaysia calendar date (Asia/Kuala_Lumpur); set on the server only.
-    """
-    search_date = malaysia_today_iso()
+    """Search for matching faces in a park's FAISS index."""
     settings = get_settings()
     k = top_k if top_k is not None else settings.top_k
     sim_threshold = threshold if threshold is not None else settings.similarity_threshold
+
+    if target_date and not _ISO_DATE_RE.match(target_date.strip()):
+        raise HTTPException(
+            status_code=400,
+            detail=f"target_date must be YYYY-MM-DD format, got: '{target_date}'",
+        )
+    if target_date:
+        target_date = target_date.strip()
 
     # ── Validate input ───────────────────────────────────────────
     err = validate_content_type(file.content_type)
@@ -60,11 +63,43 @@ async def search_face(
 
     t0 = time.perf_counter()
 
+    fm = get_faiss_manager()
+    pi = fm._parks.get(park_id)
+
+    logger.info(
+        "───────────────────────────────────────────────────────────────\n"
+        "[Search] START  park=%s  detector=%s  date=%s  threshold=%.2f  top_k=%d\n"
+        "  ├─ selfie size: %dKB\n"
+        "  ├─ index state: %s",
+        park_id, detector, target_date or "ALL", sim_threshold, k,
+        len(raw) // 1024,
+        f"{pi.total_vectors} vectors, {len(pi.day_ranges)} days, next_id={pi._next_id}"
+        if pi else "NOT LOADED",
+    )
+
+    if pi and target_date:
+        if target_date in pi.day_ranges:
+            r = pi.day_ranges[target_date]
+            logger.info(
+                "  ├─ date filter: %s → IDs [%d, %d) = %d vectors",
+                target_date, r["start_id"], r["end_id"],
+                r["end_id"] - r["start_id"],
+            )
+        else:
+            logger.warning(
+                "  ├─ date filter: %s → NOT FOUND in day_ranges!\n"
+                "  │   available dates: %s\n"
+                "  │   This search will return EMPTY — no vectors for this date.",
+                target_date, sorted(pi.day_ranges.keys()),
+            )
+
     # ── Decode image ─────────────────────────────────────────────
     try:
         image = decode_image_bytes(raw)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+    t_decode = time.perf_counter()
 
     # ── Detect single best face ──────────────────────────────────
     detector_used = detector.strip().lower()
@@ -95,15 +130,16 @@ async def search_face(
         logger.exception("Face detection failed in search (detector=%s)", detector_used)
         raise HTTPException(status_code=500, detail="Face detection error")
 
+    t_detect = time.perf_counter()
+
     if face is None:
-        fm = get_faiss_manager()
-        pi = fm._parks.get(park_id)
         faces_in_index = pi.total_vectors if pi else 0
-        filtered_ff = faces_in_index
-        if pi and search_date in pi.day_ranges:
-            r = pi.day_ranges[search_date]
-            filtered_ff = r["end_id"] - r["start_id"]
         elapsed_ms = (time.perf_counter() - t0) * 1000
+        logger.warning(
+            "[Search] NO FACE detected in selfie  park=%s  time=%.1fms\n"
+            "───────────────────────────────────────────────────────────────",
+            park_id, elapsed_ms,
+        )
         return SearchResponse(
             status="no_face",
             park_id=park_id,
@@ -112,16 +148,23 @@ async def search_face(
             query_face_confidence=0.0,
             search_time_ms=round(elapsed_ms, 2),
             faces_in_index=faces_in_index,
-            filtered_faces=filtered_ff,
             detector_used=detector_used,
-            target_date=search_date,
         )
 
+    logger.info(
+        "  ├─ face detected: confidence=%.4f  bbox=[%.0f,%.0f,%.0f,%.0f]",
+        face.confidence,
+        face.bbox[0], face.bbox[1], face.bbox[2], face.bbox[3],
+    )
+
     # ── Search FAISS ─────────────────────────────────────────────
-    fm = get_faiss_manager()
-    pi = fm._parks.get(park_id)
     if pi is None or pi.total_vectors == 0:
         elapsed_ms = (time.perf_counter() - t0) * 1000
+        logger.warning(
+            "[Search] EMPTY INDEX  park=%s  time=%.1fms\n"
+            "───────────────────────────────────────────────────────────────",
+            park_id, elapsed_ms,
+        )
         return SearchResponse(
             status="empty_index",
             park_id=park_id,
@@ -130,9 +173,7 @@ async def search_face(
             query_face_confidence=round(face.confidence, 4),
             search_time_ms=round(elapsed_ms, 2),
             faces_in_index=0,
-            filtered_faces=0,
             detector_used=detector_used,
-            target_date=search_date,
         )
 
     matches = fm.search(
@@ -140,8 +181,10 @@ async def search_face(
         query_embedding=face.embedding,
         top_k=k,
         threshold=sim_threshold,
-        target_date=search_date,
+        target_date=target_date,
     )
+
+    t_faiss = time.perf_counter()
 
     match_results = [
         SearchMatchResult(
@@ -156,24 +199,34 @@ async def search_face(
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
     filtered_count = pi.total_vectors
-    if search_date in pi.day_ranges:
-        r = pi.day_ranges[search_date]
+    if target_date and target_date in pi.day_ranges:
+        r = pi.day_ranges[target_date]
         filtered_count = r["end_id"] - r["start_id"]
 
+    decode_ms = (t_decode - t0) * 1000
+    detect_ms = (t_detect - t_decode) * 1000
+    faiss_ms = (t_faiss - t_detect) * 1000
+
+    status = "found" if match_results else "no_match"
+
     logger.info(
-        "[Search] park=%s detector=%s matches=%d/%d (filtered=%d) threshold=%.2f date=%s time=%.1fms",
-        park_id,
-        detector_used,
-        len(match_results),
-        pi.total_vectors,
-        filtered_count,
-        sim_threshold,
-        search_date,
+        "[Search] %s  park=%s  matches=%d/%d (date_filtered=%d)  time=%.1fms\n"
+        "  ├─ decode=%.1fms  detect+embed=%.1fms  faiss=%.1fms\n"
+        "  ├─ detector=%s  threshold=%.2f  date=%s\n"
+        "  └─ %s\n"
+        "───────────────────────────────────────────────────────────────",
+        status.upper(), park_id,
+        len(match_results), pi.total_vectors, filtered_count,
         elapsed_ms,
+        decode_ms, detect_ms, faiss_ms,
+        detector_used, sim_threshold, target_date or "ALL",
+        f"top match: score={match_results[0].similarity_score:.4f} image={match_results[0].image_id}"
+        if match_results
+        else "no matches above threshold",
     )
 
     return SearchResponse(
-        status="found" if match_results else "no_match",
+        status=status,
         park_id=park_id,
         matches=match_results,
         total_matches=len(match_results),
@@ -182,5 +235,5 @@ async def search_face(
         faces_in_index=pi.total_vectors,
         filtered_faces=filtered_count,
         detector_used=detector_used,
-        target_date=search_date,
+        target_date=target_date,
     )
