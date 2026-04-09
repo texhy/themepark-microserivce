@@ -2,15 +2,16 @@
 
 POST /ingest/          Single image ingestion
 POST /ingest/batch     Multi-image batch ingestion
+
+Date is always auto-set to today (Malaysia timezone) by the FAISS manager.
 """
 
 from __future__ import annotations
 
 import logging
-import re
 import time
 import uuid
-from typing import List, Optional
+from typing import List
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
@@ -29,27 +30,11 @@ router = APIRouter(prefix="/ingest", tags=["ingest"])
 
 _detector = ScrfdDetector()
 
-_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-
-
-def _validate_ingest_date(raw: Optional[str]) -> str:
-    """Return a validated YYYY-MM-DD string, or empty string to use today's date."""
-    if not raw or not raw.strip():
-        return ""
-    cleaned = raw.strip()
-    if not _ISO_DATE_RE.match(cleaned):
-        raise HTTPException(
-            status_code=400,
-            detail=f"ingest_date must be YYYY-MM-DD format, got: '{cleaned}'",
-        )
-    return cleaned
-
 
 def _process_single_image(
     raw_bytes: bytes,
     park_id: str,
     image_id: str,
-    ingest_date: str = "",
 ) -> tuple[int, List[IngestFaceResult]]:
     """Detect faces, generate embeddings, store in FAISS.
 
@@ -74,7 +59,7 @@ def _process_single_image(
         image_ids = [image_id] * len(detected)
         fm.add_embeddings_batch(
             park_id, face_ids, embeddings,
-            image_ids=image_ids, ingest_date=ingest_date,
+            image_ids=image_ids,
         )
 
         for face, fid in zip(detected, face_ids):
@@ -108,11 +93,8 @@ async def ingest_image(
     file: UploadFile = File(...),
     park_id: str = Form(...),
     image_id: str = Form(...),
-    ingest_date: Optional[str] = Form(default=None, description="ISO date (YYYY-MM-DD); defaults to today"),
 ):
     """Ingest a single photographer image: detect → embed → store in FAISS."""
-    date_str = _validate_ingest_date(ingest_date)
-
     err = validate_content_type(file.content_type)
     if err:
         raise HTTPException(status_code=400, detail=err)
@@ -124,13 +106,13 @@ async def ingest_image(
     t0 = time.perf_counter()
 
     logger.info(
-        "[Ingest] START park=%s image=%s date=%s size=%dKB",
-        park_id, image_id, date_str or "(auto→today)", len(raw) // 1024,
+        "[Ingest] START park=%s image=%s date=auto(today) size=%dKB",
+        park_id, image_id, len(raw) // 1024,
     )
 
     try:
         faces_detected, face_results = _process_single_image(
-            raw, park_id, image_id, ingest_date=date_str,
+            raw, park_id, image_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -168,15 +150,13 @@ async def ingest_batch(
     files: List[UploadFile] = File(...),
     park_id: str = Form(...),
     image_ids: str = Form(..., description="Comma-separated image IDs, one per file"),
-    ingest_date: Optional[str] = Form(default=None, description="ISO date (YYYY-MM-DD); defaults to today"),
 ):
     """Ingest multiple images in one request.
 
     The FAISS index is saved once at the end (not per-image) for efficiency.
+    Date is always auto-set to today (Malaysia timezone).
     `image_ids` should be a comma-separated string with one ID per uploaded file.
     """
-    date_str = _validate_ingest_date(ingest_date)
-
     id_list = [s.strip() for s in image_ids.split(",") if s.strip()]
     if len(id_list) != len(files):
         raise HTTPException(
@@ -191,10 +171,10 @@ async def ingest_batch(
 
     logger.info(
         "═══════════════════════════════════════════════════════════════\n"
-        "[Batch Ingest] START  park=%s  images=%d  date=%s\n"
+        "[Batch Ingest] START  park=%s  images=%d  date=auto(today)\n"
         "  ├─ index BEFORE: %d vectors, next_id=%d\n"
         "  ├─ day_ranges BEFORE: %s",
-        park_id, len(files), date_str or "(auto→today)",
+        park_id, len(files),
         vectors_before, next_id_before,
         sorted(pi_before.day_ranges.keys()) if pi_before else "[]",
     )
@@ -225,7 +205,7 @@ async def ingest_batch(
 
         try:
             n, faces = _process_single_image(
-                raw, park_id, img_id, ingest_date=date_str,
+                raw, park_id, img_id,
             )
             total_faces += n
             results.append(

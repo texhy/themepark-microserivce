@@ -1,16 +1,19 @@
 """Pipeline 2 — Kiosk / user selfie face search.
 
 POST /search/   Upload selfie → detect face → embed → search FAISS → return matches
+
+Date is always auto-set to today (Malaysia timezone). Only faces ingested
+today are searched — matching the park's daily operational hours (12pm–9pm).
 """
 
 from __future__ import annotations
 
 import logging
-import re
 import time
-from typing import Optional
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from app.config import get_settings
 from app.models.schemas import SearchMatchResult, SearchResponse
@@ -21,7 +24,7 @@ from app.services.image_utils import decode_image_bytes, validate_content_type
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/search", tags=["search"])
 
-_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_MALAYSIA_TZ = ZoneInfo("Asia/Kuala_Lumpur")
 
 
 @router.post("/", response_model=SearchResponse)
@@ -34,23 +37,13 @@ async def search_face(
         default="yolo",
         description="Detection backend: 'yolo' (fast, default) or 'scrfd' (same as ingest)",
     ),
-    target_date: Optional[str] = Form(
-        default=None,
-        description="ISO date (YYYY-MM-DD) — only search faces ingested on this date",
-    ),
 ):
-    """Search for matching faces in a park's FAISS index."""
+    """Search for matching faces in a park's FAISS index (today only)."""
     settings = get_settings()
     k = top_k if top_k is not None else settings.top_k
     sim_threshold = threshold if threshold is not None else settings.similarity_threshold
 
-    if target_date and not _ISO_DATE_RE.match(target_date.strip()):
-        raise HTTPException(
-            status_code=400,
-            detail=f"target_date must be YYYY-MM-DD format, got: '{target_date}'",
-        )
-    if target_date:
-        target_date = target_date.strip()
+    target_date = datetime.now(_MALAYSIA_TZ).date().isoformat()
 
     # ── Validate input ───────────────────────────────────────────
     err = validate_content_type(file.content_type)
@@ -71,13 +64,13 @@ async def search_face(
         "[Search] START  park=%s  detector=%s  date=%s  threshold=%.2f  top_k=%d\n"
         "  ├─ selfie size: %dKB\n"
         "  ├─ index state: %s",
-        park_id, detector, target_date or "ALL", sim_threshold, k,
+        park_id, detector, target_date, sim_threshold, k,
         len(raw) // 1024,
         f"{pi.total_vectors} vectors, {len(pi.day_ranges)} days, next_id={pi._next_id}"
         if pi else "NOT LOADED",
     )
 
-    if pi and target_date:
+    if pi:
         if target_date in pi.day_ranges:
             r = pi.day_ranges[target_date]
             logger.info(
@@ -199,7 +192,7 @@ async def search_face(
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
     filtered_count = pi.total_vectors
-    if target_date and target_date in pi.day_ranges:
+    if target_date in pi.day_ranges:
         r = pi.day_ranges[target_date]
         filtered_count = r["end_id"] - r["start_id"]
 
@@ -219,7 +212,7 @@ async def search_face(
         len(match_results), pi.total_vectors, filtered_count,
         elapsed_ms,
         decode_ms, detect_ms, faiss_ms,
-        detector_used, sim_threshold, target_date or "ALL",
+        detector_used, sim_threshold, target_date,
         f"top match: score={match_results[0].similarity_score:.4f} image={match_results[0].image_id}"
         if match_results
         else "no matches above threshold",
