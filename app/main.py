@@ -13,9 +13,10 @@ from app import __version__
 from app.api.routes import health, ingest, manage, search
 from app.config import get_settings
 from app.core.model_loader import load_models, unload_models
+from app.observability.logger import configure_logging
 from app.services.faiss_manager import get_faiss_manager
 
-logging.basicConfig(level=logging.INFO)
+configure_logging()
 logger = logging.getLogger(__name__)
 
 

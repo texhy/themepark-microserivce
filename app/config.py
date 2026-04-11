@@ -60,6 +60,18 @@ class Settings(BaseSettings):
 
     cors_origins: str = Field(default="*", validation_alias="CORS_ORIGINS")
 
+    # Redis (for async ingest pipeline)
+    redis_url: str = Field(default="redis://localhost:6379", validation_alias="REDIS_URL")
+
+    # Uploads directory (where Node.js saves uploaded images)
+    uploads_dir: str = Field(default="../uploads", validation_alias="UPLOADS_DIR")
+
+    def resolved_uploads_dir(self) -> Path:
+        p = Path(self.uploads_dir)
+        if not p.is_absolute():
+            p = _project_root() / p
+        return p
+
     def resolved_faiss_index_dir(self) -> Path:
         p = Path(self.faiss_index_dir)
         if not p.is_absolute():

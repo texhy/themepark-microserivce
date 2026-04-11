@@ -55,6 +55,25 @@ class BatchIngestResponse(BaseModel):
     processing_time_ms: float
 
 
+class BatchIngestAsyncResponse(BaseModel):
+    """Response for async batch ingest — returns immediately with a batch_id."""
+    status: str = "accepted"
+    batch_id: str
+    park_id: str
+    images_queued: int
+    message: str = "Images queued for processing. Poll /ingest/batch/status/{batch_id} for progress."
+
+
+class BatchStatusResponse(BaseModel):
+    """Status of an async batch ingest job."""
+    batch_id: str
+    status: str  # "processing" | "complete" | "not_found"
+    total: int = 0
+    done: int = 0
+    failed: int = 0
+    pending: int = 0
+
+
 # ── Search ───────────────────────────────────────────────────────────
 
 class SearchMatchResult(BaseModel):
