@@ -14,8 +14,8 @@ warnings.filterwarnings(
     module=r"insightface\.utils\.face_align",
 )
 
-from app.core._nvidia_preload import preload as _nvidia_preload_cuda_libs
+# from app.core._nvidia_preload import preload as _nvidia_preload_cuda_libs
 
-_nvidia_preload_cuda_libs()
-del _nvidia_preload_cuda_libs
+# _nvidia_preload_cuda_libs()
+# del _nvidia_preload_cuda_libs
 __version__ = "0.1.0"
