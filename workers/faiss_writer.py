@@ -177,6 +177,8 @@ def _process_message(
 
             # Mark batch as complete in Redis
             r.hset(f"batch:{batch_id}", "status", "complete")
+            r.publish("faiss:reloaded", park_id)
+            log.info("faiss_reload_published", park_id=park_id, batch_id=batch_id[:8])
             tracker.pop(batch_id)
 
     except Exception as exc:
@@ -196,6 +198,8 @@ def _process_message(
         if tracker.is_complete(batch_id):
             fm.save_index(park_id)
             r.hset(f"batch:{batch_id}", "status", "complete")
+            r.publish("faiss:reloaded", park_id)
+            log.info("faiss_reload_published", park_id=park_id, batch_id=batch_id[:8])
             tracker.pop(batch_id)
 
 

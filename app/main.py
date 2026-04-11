@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import redis as redis_lib
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -48,6 +50,43 @@ def _ensure_models_downloaded(model_dir: Path) -> None:
         ensure_yolov8_face_onnx(model_dir, "yolov8n-face.onnx")
 
 
+def _start_faiss_reload_listener() -> threading.Thread:
+    """Subscribe to Redis Pub/Sub channel `faiss:reloaded` and reload
+    the park's FAISS index from disk whenever the faiss_writer publishes."""
+    settings = get_settings()
+
+    def _listener() -> None:
+        while True:
+            try:
+                r = redis_lib.Redis.from_url(settings.redis_url)
+                pubsub = r.pubsub()
+                pubsub.subscribe("faiss:reloaded")
+                logger.info("[FAISS Reload] Subscribed to faiss:reloaded channel")
+
+                for message in pubsub.listen():
+                    if message["type"] != "message":
+                        continue
+                    park_id = message["data"].decode()
+                    logger.info("[FAISS Reload] Reloading park=%s from disk", park_id)
+                    fm = get_faiss_manager()
+                    with fm._global_lock:
+                        fm._parks.pop(park_id, None)
+                    fm.get_or_create_index(park_id)
+                    logger.info("[FAISS Reload] park=%s reloaded — %s", park_id, fm.get_stats())
+            except redis_lib.ConnectionError:
+                logger.warning("[FAISS Reload] Redis connection lost, reconnecting in 5s")
+                import time
+                time.sleep(5)
+            except Exception:
+                logger.exception("[FAISS Reload] Unexpected error, restarting listener in 5s")
+                import time
+                time.sleep(5)
+
+    t = threading.Thread(target=_listener, daemon=True, name="faiss-reload-listener")
+    t.start()
+    return t
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
@@ -63,6 +102,9 @@ async def lifespan(app: FastAPI):
         logger.exception("Model load failed — /health will report degraded state")
     fm = get_faiss_manager()
     logger.info("FAISS manager ready — %s", fm.get_stats())
+
+    _start_faiss_reload_listener()
+
     yield
     fm.save_all()
     unload_models()
